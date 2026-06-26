@@ -9,9 +9,9 @@ from google import genai
 from google.genai.errors import APIError
 
 # --- 1️⃣ الإعدادات والمفاتيح ---
-API_ID = 32209311          
-API_HASH = "861307a3d66097419a7fb08e50ebcf9b"
-BOT_TOKEN = "8822964470:AAE0bhT1ncar7lhuazGwhKsLUBZHScD1Bb8"
+API_ID =          
+API_HASH = ""
+BOT_TOKEN = ""
 
 # 🔑 ضع مفتاح Gemini الصحيح هنا
 GEMINI_API_KEY = "AQ.Ab8RN6LZL1ZhEQ9BFaVebN3-V0GaoLh9zlKuTeEDm0VrfryeVw" 
