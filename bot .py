@@ -1,225 +1,289 @@
 import os
 import json
-import re
-import fitz  # PyMuPDF
 import asyncio
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from google import genai
-from google.genai.errors import APIError
+import logging
+from io import BytesIO
 
-# --- 1️⃣ الإعدادات والمفاتيح ---
-API_ID =          
-API_HASH = ""
-BOT_TOKEN = ""
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
-# 🔑 ضع مفتاح Gemini الصحيح هنا
-GEMINI_API_KEY = "AQ.Ab8RN6LZL1ZhEQ9BFaVebN3-V0GaoLh9zlKuTeEDm0VrfryeVw" 
+import pdfplumber
+from openai import OpenAI
+from pdf2image import convert_from_bytes
+import pytesseract
+import nest_asyncio
+# ================= الإعدادات الأساسية =================
+TELEGRAM_TOKEN = ""
+OPENAI_API_KEY = ""
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-app = Client("quiz_maker_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# ================= إعدادات قائمة الانتظار =================
+pdf_queue = asyncio.Queue()
+concurrency_limit = asyncio.Semaphore(1)
 
-try:
-    ai_client = genai.Client(api_key=GEMINI_API_KEY)
-except Exception as e:
-    ai_client = None
-    print("⚠️ تنبيه: مفتاح Gemini غير صحيح!")
+user_sessions = {}
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-user_states = {}
+# (لنظام ويندوز فقط) إذا كنت تستخدم ويندوز، قم بتفعيل هذا السطر ووضع مسار tesseract
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# ================= دوال استخراج النص =================
+def extract_text_from_pdf(pdf_file_obj):
+    text = ""
+    with pdfplumber.open(pdf_file_obj) as pdf:
+        for page in pdf.pages:
+            extracted = page.extract_text()
+            if extracted:
+                text += extracted + "\n\n"
+    
+    if not text.strip():
+        logging.info("تفعيل OCR للصور الضوئية...")
+        pdf_file_obj.seek(0)
+        try:
+            images = convert_from_bytes(pdf_file_obj.read())
+            for image in images:
+                ocr_text = pytesseract.image_to_string(image, lang='ara+eng')
+                text += ocr_text + "\n\n"
+        except Exception as e:
+            logging.error(f"خطأ OCR: {e}")
+            return ""
+    return text
 
-# --- 2️⃣ رسالة الترحيب ---
-@app.on_message(filters.command("start") & filters.private)
-async def start_command(client, message):
-    user_name = message.from_user.first_name
-    await message.reply_text(
-        f"أهلاً بك يا {user_name}! 🌟\n\nأنا بوت الاختبارات الذكي. أرسل لي ملف PDF وسأقوم بتحويله إلى اختبار ممتع وتفاعلي! 🚀🔥\n\n⏳ **ملاحظة:** سيكون بين كل سؤال وسؤال 30 ثانية للتفكير."
-    )
+# ================= دالة توليد الأسئلة (170 سؤال) =================
+def generate_quiz_questions(text_content):
+    # نسمح للنص بحد أقصى 40000 حرف لاستخراج 170 سؤال (تكفي لكتاب صغير)
+    if len(text_content) > 40000:
+        text_content = text_content[:40000]
 
-# --- 3️⃣ معالجة الملف ---
-@app.on_message(filters.document & filters.private)
-async def handle_pdf(client, message):
-    if not message.document.file_name.lower().endswith('.pdf'):
-        await message.reply_text("❌ يرجى إرسال ملف بصيغة PDF فقط!")
-        return
+    prompt = f"""
+    أنت مساعد تعليمي خبير. اقرأ النص التالي بعناية، وقم بإنشاء **170 سؤالاً** بالضبط (اختيار من متعدد) بناءً على المحتوى.
+    إذا كان النص لا يكفي، أنشئ أكبر عدد ممكن حتى 170.
+    يجب أن تكون الأسئلة دقيقة جداً وذكية.
+    الرد بصيغة JSON فقط، لا تكتب أي كلام إضافي.
+    صيغة JSON: 
+    [
+        {{"question": "نص السؤال؟", "options": ["خيار 1", "خيار 2", "خيار 3", "خيار 4"], "correct": 0}},
+        {{"question": "نص السؤال الثاني؟", "options": ["خيار 1", "خيار 2", "خيار 3", "خيار 4"], "correct": 2}}
+    ]
+    (الحقل "correct" يمثل فهرس الإجابة الصحيحة من 0 إلى 3)
 
-    waiting_msg = await message.reply_text("⏳ جاري قراءة الملف وتصميم الاختبار...")
+    النص:
+    {text_content}
+    """
 
     try:
-        pdf_path = await message.download()
-        text_content = ""
-        doc = fitz.open(pdf_path)
-        for page in doc[:15]:  
-            text_content += page.get_text()
-        doc.close()
-        
-        if os.path.exists(pdf_path):
-            os.remove(pdf_path)
-
-        if len(text_content.strip()) < 50:
-            await waiting_msg.edit_text("❌ الملف فارغ أو عبارة عن صور فقط!")
-            return
-
-        prompt = (
-            "اقرأ النص التالي واصنع منه اختباراً شاملاً من نوع خيارات (MCQ) باللغة العربية.\n"
-            "يجب أن تكون الإجابة بصيغة JSON فقط كقائمة من الكائنات، بدون أي كلام جانبي.\n"
-            "الهيكل المطلوب:\n"
-            '[{"question": "نص السؤال", "options": ["خيار 1", "خيار 2", "خيار 3", "خيار 4"], "correct_index": 0, "explanation": "توضيح"}]\n\n'
-            f"النص:\n{text_content}"
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": "أنت مولد أسئلة دقيق، ترد بصيغة JSON فقط."}, {"role": "user", "content": prompt}],
+            temperature=0.5
         )
-
-        try:
-            response = ai_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt,
-            )
-        except APIError:
-            await waiting_msg.edit_text("⚠️ سيرفرات جوجل مضغوطة حالياً، حاول مجدداً بعد قليل.")
-            return
-
-        clean_text = response.text.strip()
-        clean_text = re.sub(r'^```json\s*', '', clean_text)
-        clean_text = re.sub(r'\s*```$', '', clean_text)
-        
-        try:
-            quiz_data = json.loads(clean_text)
-        except json.JSONDecodeError:
-            await waiting_msg.edit_text("❌ حدث خطأ في تنسيق البيانات، أعد المحاولة.")
-            return
-
-        await waiting_msg.delete()
-
-        user_states[message.chat.id] = {
-            "questions": quiz_data,
-            "current_index": 0,
-            "score": 0
-        }
-
-        await send_next_question(client, message.chat.id)
-
+        json_response = response.choices[0].message.content
+        if "```json" in json_response:
+            json_response = json_response.split("```json")[1].split("```")[0]
+        elif "```" in json_response:
+            json_response = json_response.split("```")[1].split("```")[0]
+        return json.loads(json_response)
     except Exception as e:
-        print(f"Error: {e}")
-        await message.reply_text("❌ حصلت لخبطة أثناء توليد الأسئلة، يرجى إرسال الملف مرة أخرى.")
+        logging.error(f"OpenAI Error: {e}")
+        return None
 
-# --- 4️⃣ دالة إرسال السؤال التالي ---
-async def send_next_question(client, chat_id):
-    state = user_states.get(chat_id)
-    if not state:
-        return
-
-    idx = state["current_index"]
-    questions = state["questions"]
-
-    # 🏁 نهاية الاختبار
-    if idx >= len(questions):
-        score = state["score"]
-        total = len(questions)
-        await client.send_message(
-            chat_id, 
-            f"🏁 **خلصت الاختبار ياشطور!** 🎉\n\n"
-            f"🎯 الدرجة النهائية: **{score} من {total}**\n\n"
-            f"**كفوووو 👏🏻👏🏻👏🏻🌟🌟🌟🌼🌼🌼**"
-        )
-        del user_states[chat_id]
-        return
-
-    # 🌟 محطات تشجيع (يتم إرسالها مباشرة بدون تأخير 30 ثانية، لأنها مجرد تشجيع)
-    if idx > 0 and idx % 10 == 0:
-        station_num = idx // 10
-        msgs = {
-            1: "✨ **رهييب وربي! أول 10 أسئلة خلفنا!** استمر بالتألق 👏🌼🌟",
-            2: "⭐ **كفو عليك! 20 سؤالاً بإصرار!** احسنتتتء! 🌟🌼👏",
-            3: "🔥 **مستوى خارق! 30 سؤالاً!** استمروا في الاكتساح! 👏🌟🌼"
-        }
-        motivate_text = msgs.get(station_num, "🚀 **تستحق القمه!** إنجاز مذهل! 🌼🌟👏")
-        continue_btn = InlineKeyboardMarkup([
-            [InlineKeyboardButton("إكمال الاختبار 🚀", callback_data="continue_quiz")]
-        ])
-        await client.send_message(chat_id, motivate_text, reply_markup=continue_btn)
-        return
-
-    # عرض السؤال الحالي
-    q = questions[idx]
-    
-    buttons = []
-    emojis = ["🔵", "🟢", "🔴", "🟡"] 
-    for i, option in enumerate(q["options"]):
-        button_text = f"{emojis[i % len(emojis)]} {option}"
-        buttons.append([InlineKeyboardButton(button_text, callback_data=f"ans_{i}")])
-
-    text = f"📝 **السؤال رقم {idx + 1}/{len(questions)}**\n\n❓ {q['question']}"
-    
-    await client.send_message(
-        chat_id, 
-        text, 
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-# --- 5️⃣ استقبال ضغطات الأزرار ---
-@app.on_callback_query()
-async def handle_callback(client, callback_query: CallbackQuery):
-    chat_id = callback_query.message.chat.id
-    state = user_states.get(chat_id)
-    
-    if not state:
-        await callback_query.answer("انتهى هذا الاختبار.")
-        return
-
-    # زر إكمال الاختبار في محطات التشجيع
-    if callback_query.data == "continue_quiz":
-        await callback_query.message.delete()
-        await send_next_question(client, chat_id)
-        return
-
-    idx = state["current_index"]
-    questions = state["questions"]
-    q = questions[idx]
-
-    chosen_index = int(callback_query.data.split("_")[1])
-    correct_index = int(q["correct_index"])
-
-    # معالجة الإجابة
-    if chosen_index == correct_index:
-        state["score"] += 1
-        result_text = "✅ **إجابة صحيحة!** 🎉"
+# ================= معالج المهام الخلفي =================
+async def worker():
+    while True:
+        job = await pdf_queue.get()
+        user_id, update, context, pdf_bytes = job
+        user_name = update.effective_user.first_name or "صديقي"
         
-        # 🌼 ورد صفراء تظهر وتختفي
-        try:
-            celebrate_msg = await client.send_message(
-                chat_id,
-                "🌼🌼🌼🌼🌼 **إجابة رائعة! واصل التألق!** 🌼🌼🌼🌼🌼"
-            )
-            await asyncio.sleep(2.5)
-            await celebrate_msg.delete()
-        except Exception:
-            pass
-    else:
-        correct_option_text = q["options"][correct_index]
-        result_text = f"❌ **إجابة خاطئة!**\n\n💡 الإجابة الصحيحة: **{correct_option_text}**"
+        async with concurrency_limit:
+            try:
+                await context.bot.send_message(chat_id=user_id, text=f"🔄 جاري معالجة ملفك يا **{user_name}**، فضلاً انتظر...")
+                text = extract_text_from_pdf(pdf_bytes)
+                
+                if not text.strip():
+                    await context.bot.send_message(chat_id=user_id, text="❌ فشل استخراج النص. تأكد أن الـ PDF يحتوي على نصوص.")
+                    pdf_queue.task_done()
+                    continue
 
-    # إضافة الشرح
-    if q.get("explanation"):
-        result_text += f"\n\nℹ️ **توضيح:** {q['explanation']}"
+                await context.bot.send_message(chat_id=user_id, text="🧠 جاري إنشاء 170 سؤالاً (أو أقل حسب محتوى الـ PDF)...")
+                questions = generate_quiz_questions(text)
 
-    # 👇 تعديل الرسالة: عرض النتيجة وإزالة الأزرار فوراً
-    await callback_query.message.edit_text(
-        f"📝 **السؤال رقم {idx + 1}/{len(questions)}**\n\n❓ {q['question']}\n\n{result_text}"
+                if not questions or len(questions) == 0:
+                    await context.bot.send_message(chat_id=user_id, text="❌ حدث خطأ أثناء توليد الأسئلة.")
+                    pdf_queue.task_done()
+                    continue
+
+                total = len(questions)
+                user_sessions[user_id] = {
+                    "questions": questions,
+                    "current_q": 0,
+                    "score": 0,
+                    "total": total,
+                    "name": user_name,
+                    "checkpoint_pending": False  # حالة التوقف/الاستمرار
+                }
+                
+                await context.bot.send_message(chat_id=user_id, text=f"✅ مرحباً **{user_name}**! تم توليد **{total}** سؤالاً بدقة عالية. 🚀\n⚠️ ملاحظة: بعد كل 20 سؤالاً، سأسألك إذا كنت ترغب في إكمال البقية.")
+                await send_question(context, user_id)
+
+            except Exception as e:
+                logging.error(f"Error processing job for user {user_id}: {e}")
+                await context.bot.send_message(chat_id=user_id, text="❌ حدث خطأ غير متوقع.")
+            pdf_queue.task_done()
+
+# ================= معالج استقبال الملف =================
+async def handle_pdf_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.document: return
+    user_name = update.effective_user.first_name or "صديقي"
+    file_name = update.message.document.file_name
+    if not file_name.lower().endswith('.pdf'):
+        await update.message.reply_text("⚠️ يرجى رفع ملف بصيغة PDF فقط.")
+        return
+
+    queue_size = pdf_queue.qsize()
+    await update.message.reply_text(
+        f"📥 أهلاً بك يا **{user_name}**! تم استلام ملفك.\n"
+        f"⏳ ** يتم تحليل الملف    : {queue_size}**\n"
+        f"سيبدأ البوت بتحضير الاختبار  .   🌟"
     )
+    try:
+        file = await update.message.document.get_file()
+        pdf_bytes = BytesIO()
+        await file.download_to_memory(pdf_bytes)
+        pdf_bytes.seek(0)
+        await pdf_queue.put((update.effective_user.id, update, context, pdf_bytes))
+    except Exception as e:
+        logging.error(f"Upload error: {e}")
+        await update.message.reply_text("❌ حدث خطأ أثناء تحميل الملف.")
 
-    # زيادة رقم السؤال
-    state["current_index"] += 1
-
-    # ⏳ نظام التأخير 30 ثانية قبل السؤال التالي
-    await client.send_message(
-        chat_id, 
-        f"⏳ يرجى الانتظار **30 ثانية** قبل السؤال التالي..."
-    )
+# ================= دوال السؤال (مع نظام الـ Checkpoint) =================
+async def send_question(context, user_id):
+    session = user_sessions.get(user_id)
+    if not session: return
     
-    await asyncio.sleep(30)  # هنا التأخير 30 ثانية
+    current_q = session["current_q"]
+    total = session["total"]
+    
+    # لقد انتهى الاختبار (أو وصلنا إلى النهاية)
+    if current_q >= total:
+        await end_quiz(context, user_id)
+        return
 
-    # حذف رسالة الانتظار وإرسال السؤال الجديد
-    await send_next_question(client, chat_id)
+    # ✅ منطق "بعد كل 20 سؤالاً" (Checkpoint)
+    # نفذ هذا الشرط إذا تجاوزنا السؤال 0، وكان الرقم يقبل القسمة على 20، ولم نطلب التوقف مسبقاً
+    if current_q > 0 and current_q % 20 == 0 and not session.get("checkpoint_pending"):
+        session["checkpoint_pending"] = True
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ متابعة الإكمال", callback_data="continue_quiz"),
+                InlineKeyboardButton("⏹️ التوقف الآن", callback_data="stop_quiz")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"🌟 **عظيم يا {session['name']}! لقد أجبت على {current_q} سؤالاً حتى الآن!**\n\n💪 استمر بنفس القوة والنشاط!\n\n🛑 هل تريد إكمال الأسئلة المتبقية أم ترغب في التوقف هنا وعرض نتيجتك؟",
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+        return # لا نرسل السؤال التالي حتى يقرر المستخدم
+
+    # إذا لم يكن هناك توقف، نرسل السؤال العادي
+    q_data = session["questions"][current_q]
+    options = q_data["options"]
+    keyboard = [[InlineKeyboardButton(options[i], callback_data=f"ans_{i}")] for i in range(len(options))]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    text = f"🎯 **سؤال {current_q + 1}/{total}**\n\n{q_data['question']}"
+    await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+
+# ================= معالج التوقف أو الاستمرار =================
+async def handle_quiz_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    session = user_sessions.get(user_id)
+    
+    if not session: return
+    
+    if query.data == "continue_quiz":
+        session["checkpoint_pending"] = False
+        await query.edit_message_text("🚀 **رائع! لنكمل المشوار!** 🌟")
+        await send_question(context, user_id)
+    elif query.data == "stop_quiz":
+        session["checkpoint_pending"] = False
+        await query.edit_message_text("⏹️ **حسناً! سيتم إنهاء الاختبار وعرض النتيجة الآن.**")
+        await end_quiz(context, user_id)
+
+# ================= معالج الإجابات =================
+async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    session = user_sessions.get(user_id)
+    if not session: return
+
+    # لن نسمح بالإجابة إذا كان البوت ينتظر قرار "اكمل أم توقف"
+    if session.get("checkpoint_pending"):
+        await query.message.reply_text("⏳ يرجى اتخاذ قرار (متابعة أو توقف) قبل الإجابة على السؤال التالي.")
+        return
+
+    choice = int(query.data.split("_")[1])
+    current_index = session["current_q"]
+    is_correct = (choice == session["questions"][current_index]["correct"])
+    
+    if is_correct:
+        session["score"] += 1
+        await query.message.reply_text("✅ **إجابة صحيحة! أحسنت يا بطل! 🌟**")
+    else:
+        correct_option = session["questions"][current_index]["options"][session["questions"][current_index]["correct"]]
+        await query.message.reply_text(f"❌ **للأسف، أخطأت!** الإجابة الصحيحة هي: **{correct_option}** 💪 لا بأس، حاول في القادم.")
+
+    session["current_q"] += 1
+    await send_question(context, user_id)
+
+# ================= إنهاء الاختبار =================
+async def end_quiz(context, user_id):
+    session = user_sessions.pop(user_id, None)
+    name = session["name"] if session else "صديقي"
+    score = session["score"] if session else 0
+    total = session["total"] if session else 0
+    
+    final_msg = (
+        f"🏁 **ألف مبروك يا {name}! انتهى الاختبار!** 🎉\n\n"
+        f"📊 نتيجتك النهائية: **{score} من {total}**\n\n"
+        f"🌟 170  كفووو يارهيب خلصت سؤالاً  🌼\n"
+        f"لقد كنت رائعاً، نتمنى لك التوفيق دائماً ❤️\n\n"
+        f"إذا أردت اختباراً جديداً، ارفع ملف PDF آخر!"
+    )
+    await context.bot.send_message(chat_id=user_id, text=final_msg, parse_mode="Markdown")
+
+# ================= الأمر الترحيبي =================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_name = update.effective_user.first_name or "صديقي"
+    await update.message.reply_text(
+        f"🌟 **أهلاً وسهلاً بك يا {user_name} في بوت الاختبارات الذكي!** 🌟\n\n"
+        f"🚀 ارفع ملف PDF (نص أو صور ضوئية) وسأستخرج منه **حتى 170 سؤالاً**.\n"
+        f"📌 **ميزة جديدة:** بعد كل 20 سؤالاً، سأعطيك خيار **الاستمرار أو التوقف**.\n\n"
+        f"🌼 بالتوفيق يا بطل! 🌼",
+        parse_mode="Markdown"
+    )
+
+# ================= تشغيل البوت =================
+async def main():
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(MessageHandler(filters.Document.FileExtension("pdf"), handle_pdf_upload))
+    application.add_handler(CallbackQueryHandler(handle_answer, pattern="^ans_"))
+    application.add_handler(CallbackQueryHandler(handle_quiz_decision, pattern="^(continue_quiz|stop_quiz)$"))
+    asyncio.create_task(worker())
+    print("🚀 بوت 170 سؤالاً يعمل مع نظام التوقف/الاستمرار...")
+    application.run_polling()
 
 if __name__ == "__main__":
-    print("🚀 صاروخ الاختبارات التفاعلية (مع المؤقت) انطلق!")
-    if GEMINI_API_KEY == "YOUR_REAL_GEMINI_API_KEY_HERE":
-        print("⚠️ تنبيه: لم يتم وضع مفتاح Gemini الصحيح بعد!")
-    app.run()
+    nest_asyncio.apply()
+    asyncio.run(main())
