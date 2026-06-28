@@ -1,3 +1,11 @@
 pyrogram
-PyMuPDF
-google-generativeai
+tgcrypto
+pymupdf
+python-dotenv
+aiosqlite
+pillow
+pytesseract
+aiofiles
+pdfplumber
+openai
+pdf2image
